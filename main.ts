@@ -6,7 +6,7 @@
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
 
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
@@ -396,13 +396,18 @@ function parseUnified(lines: string[], strict: boolean): Edit[] {
     if (sec.newPath === null) sec.newPath = '';
     while (i < n) {
       const h = lines[i]!;
-      if (!h.startsWith('@@')) break;
-      const hm = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(h);
-      if (hm === null) throw new Exit2(`error: parse ${i + 1}`);
-      const body = parseHunkBody(lines, i);
-      body.hunk.a = Number(hm[1]);
-      sec.hunks.push(body.hunk);
-      i = body.next;
+      if (h.startsWith('diff --git ')) break;
+      if (h.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) break;
+      if (h.startsWith('@@')) {
+        const hm = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(h);
+        if (hm === null) throw new Exit2(`error: parse ${i + 1}`);
+        const body = parseHunkBody(lines, i);
+        body.hunk.a = Number(hm[1]);
+        sec.hunks.push(body.hunk);
+        i = body.next;
+        continue;
+      }
+      i++;
     }
     sections.push(sec);
   }
@@ -579,6 +584,13 @@ interface VChunk {
   eof: boolean;
 }
 
+/** End of a V4A section body: the next section start, or the `*** End Patch` line. */
+function v4aSectionEnd(lines: string[], start: number, last: number): number {
+  let end = start;
+  while (end < last && !lines[end]!.startsWith('*** Add File: ') && !lines[end]!.startsWith('*** Delete File: ') && !lines[end]!.startsWith('*** Update File: ')) end++;
+  return end;
+}
+
 function parseV4a(lines: string[], strict: boolean): Edit[] {
   const first = lines.findIndex((l) => !blank(l));
   if (first < 0) throw new Exit2('error: parse 1');
@@ -601,52 +613,56 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
     }
     if (l.startsWith('*** Add File: ')) {
       const p = l.slice('*** Add File: '.length).trim();
-      i++;
-      const collected: Op[] = [];
-      while (i < last) {
-        const b = lines[i]!;
-        if (b.startsWith('+')) {
-          collected.push({ kind: 'add', text: b.slice(1) });
-          i++;
-        } else if (b === '') {
-          collected.push({ kind: 'ctx', text: '', blank: true });
-          i++;
-        } else break;
+      const end = v4aSectionEnd(lines, i + 1, last);
+      let bodyEnd = end;
+      while (bodyEnd > i + 1 && blank(lines[bodyEnd - 1]!)) bodyEnd--;
+      const fileLines: string[] = [];
+      for (let j = i + 1; j < bodyEnd; j++) {
+        const b = lines[j]!;
+        if (b.startsWith('+')) fileLines.push(b.slice(1));
+        else if (b === '') fileLines.push('');
+        else throw new Exit2(`error: parse ${j + 1}`);
       }
-      while (collected.length > 0 && collected[collected.length - 1]!.blank === true) collected.pop();
-      const fileLines = collected.map((o) => o.text);
       edits.push((tree) => {
         if (!safe(p)) throw new Fail('unsafe', p);
         if (tree.get(p) !== null) throw new Fail('exists', p);
         tree.now.set(p, fileLines.length === 0 ? '' : fileLines.join('\n') + '\n');
       });
+      i = end;
       continue;
     }
     if (l.startsWith('*** Delete File: ')) {
       const p = l.slice('*** Delete File: '.length).trim();
-      i++;
+      const end = v4aSectionEnd(lines, i + 1, last);
+      let bodyEnd = end;
+      while (bodyEnd > i + 1 && blank(lines[bodyEnd - 1]!)) bodyEnd--;
+      for (let j = i + 1; j < bodyEnd; j++) {
+        if (!blank(lines[j]!)) throw new Exit2(`error: parse ${j + 1}`);
+      }
       edits.push((tree) => {
         if (!safe(p)) throw new Fail('unsafe', p);
         if (tree.get(p) === null) throw new Fail('missing', p);
         tree.now.set(p, null);
       });
+      i = end;
       continue;
     }
     if (l.startsWith('*** Update File: ')) {
       const p = l.slice('*** Update File: '.length).trim();
       const updateLine = i + 1;
-      i++;
-      while (i < last && blank(lines[i]!)) i++;
+      const end = v4aSectionEnd(lines, i + 1, last);
+      let bodyEnd = end;
+      while (bodyEnd > i + 1 && blank(lines[bodyEnd - 1]!)) bodyEnd--;
+      let j = i + 1;
       let moveTo: string | null = null;
-      if (i < last && lines[i]!.startsWith('*** Move to: ')) {
-        moveTo = lines[i]!.slice('*** Move to: '.length).trim();
-        i++;
-        while (i < last && blank(lines[i]!)) i++;
+      if (j < bodyEnd && lines[j]!.startsWith('*** Move to: ')) {
+        moveTo = lines[j]!.slice('*** Move to: '.length).trim();
+        j++;
       }
       const chunks: VChunk[] = [];
       let cur: VChunk | null = null;
-      while (i < last) {
-        const b = lines[i]!;
+      while (j < bodyEnd) {
+        const b = lines[j]!;
         if (b.startsWith('@@')) {
           if (cur !== null) {
             chunks.push(cur);
@@ -654,40 +670,36 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
           }
           const anchorText = b.slice(2).trim();
           cur = { anchor: anchorText === '' ? null : anchorText, ops: [], eof: false };
-          i++;
+          j++;
           continue;
         }
-        if (b.trim() === '*** End of File') {
-          if (cur === null) throw new Exit2(`error: parse ${i + 1}`);
+        if (b === '*** End of File') {
+          if (cur === null) throw new Exit2(`error: parse ${j + 1}`);
           cur.eof = true;
           chunks.push(cur);
           cur = null;
-          i++;
+          j++;
           continue;
         }
-        if (b.startsWith('*** Add File: ') || b.startsWith('*** Delete File: ') || b.startsWith('*** Update File: ')) break;
-        if (blank(b)) {
+        if (b === '') {
           if (cur === null) cur = { anchor: null, ops: [], eof: false };
-          cur.ops.push({ kind: 'ctx', text: '', blank: true });
-          i++;
+          cur.ops.push({ kind: 'ctx', text: '' });
+          j++;
           continue;
         }
         if (b.startsWith(' ') || b.startsWith('-') || b.startsWith('+')) {
           if (cur === null) cur = { anchor: null, ops: [], eof: false };
           const kind = b[0] === ' ' ? 'ctx' : b[0] === '-' ? 'del' : 'add';
           cur.ops.push({ kind, text: b.slice(1) });
-          i++;
+          j++;
           continue;
         }
-        throw new Exit2(`error: parse ${i + 1}`);
+        throw new Exit2(`error: parse ${j + 1}`);
       }
       if (cur !== null) chunks.push(cur);
-      if (chunks.length > 0) {
-        const lc = chunks[chunks.length - 1]!;
-        while (lc.ops.length > 0 && lc.ops[lc.ops.length - 1]!.blank === true) lc.ops.pop();
-      }
       if (chunks.length === 0 && moveTo === null) throw new Exit2(`error: parse ${updateLine}`);
       edits.push(v4aUpdateEdit(p, moveTo, chunks, strict));
+      i = end;
       continue;
     }
     throw new Exit2(`error: parse ${i + 1}`);
@@ -820,13 +832,29 @@ function run(args: string[]): { code: number; out: string[] } {
   }
   rows.sort((a, b) => Buffer.compare(Buffer.from(a.key), Buffer.from(b.key)));
   if (!check) {
+    const deleted: string[] = [];
+    for (const p of [...tree.now.keys()]) {
+      if (tree.now.get(p)! === null) {
+        rmSync(p, { force: true });
+        deleted.push(p);
+      }
+    }
+    for (const p of deleted) {
+      let dir = dirname(p);
+      while (dir !== '.' && dir !== '') {
+        try {
+          rmdirSync(dir);
+        } catch {
+          break;
+        }
+        dir = dirname(dir);
+      }
+    }
     for (const p of [...tree.now.keys()]) {
       const now = tree.now.get(p)!;
-      if (now === null) rmSync(p, { force: true });
-      else {
-        mkdirSync(dirname(p), { recursive: true });
-        writeFileSync(p, now);
-      }
+      if (now === null) continue;
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, now);
     }
   }
   const out = rows.map((r) => r.text);
